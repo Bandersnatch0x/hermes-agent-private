@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,13 @@ class ProviderProfile:
 
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
+
+    # Optional factory that returns the httpx.Client used by the OpenAI SDK.
+    # Receives (base_url, proxy_url) and must return an httpx.Client (or None
+    # to fall back to the default keepalive client). Plugins use this to
+    # install custom transports — e.g. stripping x-stainless-* headers that
+    # some gateways block.
+    http_transport_factory: Optional[Callable[[str, Optional[str]], Any]] = None
 
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
