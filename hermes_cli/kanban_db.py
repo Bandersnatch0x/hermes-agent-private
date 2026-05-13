@@ -3919,78 +3919,16 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
-
-    The profile's ``runner.kind`` selects which spawn implementation
-    runs: the default ``"hermes"`` keeps the historical
-    ``hermes -p ... chat`` path; ``"claude-code"`` routes through
-    :func:`_spawn_claude_code_runner` which spawns the dedicated
-    ``claude`` CLI wrapper. Unknown kinds raise ``ValueError`` so
-    typos surface loudly instead of silently degrading to a default.
     """
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    from hermes_cli.profiles import normalize_profile_name, _read_runner_config
+    from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
-    runner_cfg = _read_runner_config(profile_arg)
-    runner_kind = runner_cfg.get("kind", "hermes")
 
-    env = _build_worker_env(task, workspace, board, profile_arg)
-    log_f, log_path = _open_worker_log(task.id, board)
-
-    if runner_kind == "hermes":
-        cmd = _build_hermes_worker_cmd(task, profile_arg)
-    elif runner_kind == "claude-code":
-        cmd = _build_claude_runner_cmd()
-    else:
-        log_f.close()
-        raise ValueError(
-            f"Unknown runner.kind {runner_kind!r} in profile {profile_arg!r}; "
-            "expected 'hermes' or 'claude-code'."
-        )
-
-    try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        log_f.close()
-        if runner_kind == "hermes":
-            raise RuntimeError(
-                "`hermes` executable not found on PATH. "
-                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-            )
-        raise RuntimeError(
-            f"Failed to spawn runner.kind={runner_kind!r}: executable not found. "
-            f"Verify {cmd[0]!r} is on the dispatcher's PATH."
-        )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
-    return proc.pid
-
-
-def _build_worker_env(
-    task: Task,
-    workspace: str,
-    board: Optional[str],
-    profile_arg: str,
-) -> dict:
-    """Assemble the env vars every worker (hermes or claude-runner) sees.
-
-    Centralised so the two spawn paths stay in lockstep — adding a new
-    ``HERMES_KANBAN_*`` pin only needs touching one place.
-    """
+    prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -4037,32 +3975,7 @@ def _build_worker_env(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
-    return env
 
-
-def _open_worker_log(task_id: str, board: Optional[str]):
-    """Open the rotated per-task log file in append-binary mode.
-
-    Returns ``(file_handle, log_path)``. Caller is responsible for not
-    closing the handle in the parent — Popen inherits it to the child.
-    """
-    log_dir = worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{task_id}.log"
-    _rotate_worker_log(log_path, DEFAULT_LOG_ROTATE_BYTES)
-    # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
-    return log_f, log_path
-
-
-def _build_hermes_worker_cmd(task: Task, profile_arg: str) -> list:
-    """Build the ``hermes -p <profile> ... chat -q ...`` argv vector.
-
-    Kept stable across the runner-kind refactor: same prompt template,
-    same auto-loaded ``--skills kanban-worker``, same per-task
-    ``--skills`` propagation.
-    """
-    prompt = f"work kanban task {task.id}"
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -4091,20 +4004,39 @@ def _build_hermes_worker_cmd(task: Task, profile_arg: str) -> list:
         "chat",
         "-q", prompt,
     ])
-    return cmd
+    # Redirect output to a per-task log under <board-root>/logs/.
+    # Anchored at the board root (not the shared kanban root), so
+    # `hermes kanban log` on a specific board reads its own file and
+    # logs don't collide across boards that happen to share task ids.
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    _rotate_worker_log(log_path, DEFAULT_LOG_ROTATE_BYTES)
 
-
-def _build_claude_runner_cmd() -> list:
-    """Build the argv for the ``claude-code`` runner wrapper.
-
-    Always invokes the wrapper as ``python -m hermes_cli.kanban_claude_runner``
-    so it resolves through the same interpreter that started the
-    dispatcher — no PATH dependency on a ``hermes-kanban-claude-runner``
-    shim. All other config (max_turns, allowed_tools,
-    dangerously_skip_permissions, …) flows in through the worker
-    env + profile ``config.yaml``, read by the wrapper itself.
-    """
-    return [sys.executable, "-m", "hermes_cli.kanban_claude_runner"]
+    # Use 'a' so a re-run on unblock appends rather than overwrites.
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`hermes` executable not found on PATH. "
+            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
+    # NOTE: we intentionally do NOT close log_f here — we want Popen's
+    # child process to keep writing after this function returns.  The
+    # handle is kept alive by the child's inheritance.  The parent's
+    # reference goes out of scope and is GC'd, but the OS-level FD stays
+    # open in the child until the child exits.
+    return proc.pid
 
 
 # ---------------------------------------------------------------------------

@@ -458,53 +458,6 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
 
 
-def _read_runner_config(profile_name_or_dir) -> dict:
-    """Read the ``runner:`` section from a profile's config.yaml.
-
-    Accepts either a profile name (resolved via ``get_profile_dir`` /
-    default home) or a :class:`pathlib.Path` to the profile dir.
-
-    Returns a dict with at least ``kind`` (``"hermes"`` by default).
-    Additional keys (``max_turns``, ``output_format``, ``allowed_tools``,
-    ``dangerously_skip_permissions``, ``timeout``, ``model``, …) are
-    passed through to whichever runner implementation the dispatcher
-    routes to.
-
-    Missing config.yaml, missing ``runner:`` block, or any parse error
-    returns ``{"kind": "hermes"}`` so dispatch never breaks on a typo.
-    """
-    DEFAULT = {"kind": "hermes"}
-
-    if isinstance(profile_name_or_dir, Path):
-        profile_dir = profile_name_or_dir
-    else:
-        try:
-            name = normalize_profile_name(str(profile_name_or_dir))
-            if name == "default":
-                profile_dir = _get_default_hermes_home()
-            else:
-                profile_dir = get_profile_dir(name)
-        except Exception:
-            return DEFAULT
-
-    config_path = profile_dir / "config.yaml"
-    if not config_path.exists():
-        return DEFAULT
-
-    try:
-        import yaml
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        runner_cfg = cfg.get("runner")
-        if not isinstance(runner_cfg, dict):
-            return DEFAULT
-        out = dict(runner_cfg)
-        out.setdefault("kind", "hermes")
-        return out
-    except Exception:
-        return DEFAULT
-
-
 def _check_gateway_running(profile_dir: Path) -> bool:
     """Check if a gateway is running for a given profile directory."""
     try:
